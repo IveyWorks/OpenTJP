@@ -1,3 +1,6 @@
+# OpenTJP tracker with MLX90614 temperature sensor
+# Release 2025-01-12a
+
 MY_CHANNEL = 599
 MY_CALLSIGN = 'N2QST'
 MY_BAND = '20m'       # ['10m', '12m', '15m', '17m', '20m', '30m', '40m', '80m', '160m']  remember to include the 'm' character
@@ -36,7 +39,37 @@ MY_DEBUG_PRINT_ENABLE = True
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# Release 2025-01-13a
+
+
+# """
+# MicroPython MLX90614 IR temperature sensor driver
+# https://github.com/mcauser/micropython-mlx90614
+# 
+# MIT License
+# Copyright (c) 2016 Mike Causer
+# Copyright (c) 2025 Craig Ivey
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# """
+
+
+
 
 import os
 import sys
@@ -48,9 +81,67 @@ import time
 #import pyb
 
 
+# I2C1
+# GPIO Pin 19 = Pico pin 25  (I2C1, SCL)
+# GPIO Pin 18 = Pico pin 24  (I2C1, SDA)
+_I2C_Channel = 1
+_I2C_GPIO_SCL_Pin = 19
+_I2C_GPIO_SDA_Pin = 18
+_I2C_Address = 0x5a
+
+
+
+import ustruct
+
+class SensorBase:
+
+    def read16(self, register):
+        data = self.i2c.readfrom_mem(self.address, register, 2)
+        return ustruct.unpack('<H', data)[0]
+
+    def read_temp(self, register):
+        temp = self.read16(register);
+        # apply measurement resolution (0.02 degrees per LSB)
+        temp *= .02;
+        # Kelvin to Celcius
+        temp -= 273.15;
+        return temp;
+
+    def read_ambient_temp(self):
+        return self.read_temp(self._REGISTER_TA)
+
+    def read_object_temp(self):
+        return self.read_temp(self._REGISTER_TOBJ1)
+
+    def read_object2_temp(self):
+        if self.dual_zone:
+            return self.read_temp(self._REGISTER_TOBJ2)
+        else:
+            raise RuntimeError("Device only has one thermopile")
+
+class MLX90614(SensorBase):
+
+    _address = _I2C_Address
+
+    _REGISTER_TA = 0x06
+    _REGISTER_TOBJ1 = 0x07
+    _REGISTER_TOBJ2 = 0x08
+
+    def __init__(self, i2c, address=_address):
+        self.i2c = i2c
+        self.address = address
+        _config1 = i2c.readfrom_mem(address, 0x25, 2)
+        _dz = ustruct.unpack('<H', _config1)[0] & (1<<6)
+        self.dual_zone = True if _dz else False
+
+
 
 global clockgen
 global uart1
+global sensor
+global PicoTemp
+global AmbientTemp
+global ObjectTemp
 
 #isUSBconnected = bool(machine.mem32[0x50110000 + 0x50] & (1<<16))
 MY_RMC_VALID = False
@@ -71,7 +162,7 @@ MY_SIGGENPARAMS = None
 WARMUP_PERIOD_SEC = 30
 IS_CONNECTED = True
 MY_ET_SLOT = 2
-MY_BIGNUM = 0
+#MY_BIGNUM = 0
 MY_BAND = MY_BAND.lower()
 
 MY_BIGCOUNTER = 0
@@ -103,10 +194,10 @@ SIGGENPARAMS = {
             [[15, 8, 25265, 1866], [15, 8, 63677, 4703], [15, 8, 14853, 1097], [15, 8, 7000, 517]],
             [[15, 8, 11793, 871], [15, 8, 17263, 1275], [15, 8, 30938, 2285], [15, 8, 129398, 9557]]]
     ,
-    '20m': [ [[15, 8, 20865, 1061], [15, 8, 36440, 1853] , [15, 8, 41553, 2113], [15, 8, 31091, 1581]],   # Freq lane 1,  20 Hz +8
-             [[15, 8, 34375, 1748], [15, 8, 39193, 1993], [15, 8, 24444, 1243], [15, 8, 117107, 5955]],   # Freq lane 2,  60 Hz
-             [[15, 8, 21966, 1117], [15, 8, 13156, 669], [15, 8, 74413, 3784], [15, 8, 34945, 1777]],     # Freq lane 3, 140 Hz
-             [[15, 8, 45918, 2335], [15, 8, 66645, 3389] , [15, 8, 24955, 1269], [15, 8, 41513, 2111]]  ] # Freq lane 4, 180 Hz
+    '20m': [ [[15, 8, 31445, 1599], [15, 8, 104561, 5317] , [15, 8, 20865, 1061], [15, 8, 36440, 1853]],   # Freq lane 1,  20 Hz
+             [[15, 8, 54237, 2758], [15, 8, 19685, 1001], [15, 8, 34375, 1748], [15, 8, 24503, 1246]],     # Freq lane 2,  60 Hz
+             [[15, 8, 44109, 2243], [15, 8, 70421, 3581], [15, 8, 21966, 1117], [15, 8, 13156, 669]],   # Freq lane 3, 140 Hz
+             [[15, 8, 12566, 639], [15, 8, 37639, 1914] , [15, 8, 45918, 2335], [15, 8, 74983, 3813]]  ] # Freq lane 4, 180 Hz
     ,         
     '22m': [ [[15, 8, 37097, 1786], [15, 8, 126890, 6109], [15, 8, 66301, 3192], [15, 8, 30928, 1489]], 
             [[15, 8, 27563, 1327], [15, 8, 80965, 3898], [15, 8, 41978, 2021], [15, 8, 31551, 1519]], 
@@ -161,6 +252,39 @@ def eprint(*args):
             print(val, end=' ')
         print('')
 
+
+def encodeBigNumTemperatures():
+    #PicoTemp, AmbientTemp, ObjectTemp
+
+    out = 0
+    
+    x = int(PicoTemp)
+    if x < -60:
+        x = -60
+    elif x > 59:
+        x = 59
+    x += 60
+    out = out * 120 + x
+    
+    x = int(AmbientTemp)
+    if x < -60:
+        x = -60
+    elif x > 59:
+        x = 59
+    x += 60
+    out = out * 120 + x
+
+    x = int(ObjectTemp)
+    if x < -60:
+        x = -60
+    elif x > 59:
+        x = 59
+    x += 60
+    out = out * 120 + x
+
+    return out
+
+    
 
 def isGeofenced(test_grid):
     if not MY_GEOFENCE_ENABLE: return False
@@ -228,9 +352,9 @@ def enableOsc():
     PowerOsc.value(0)  # 0 = ON
     #led.value(1)
     time.sleep(0.5)
-    #devlist = i2c.scan()
+    #devlist = i2c0.scan()
     #eprint(devlist)
-    clockgen = SI5351.SI5351( i2c) 
+    clockgen = SI5351.SI5351( i2c0) 
     clockgen.begin()
     clockgen.setClockBuilderData()
     PLL_mult = MY_SIGGENPARAMS[0][0]
@@ -1189,7 +1313,23 @@ def CreateNMEAString(inStr):
 
   
 def GetTemperature():
-    return int(27 - (((3.3/65535) * machine.ADC(4).read_u16()) - 0.706)/0.001721)
+    
+    Pico_Temp_C = int(27 - (((3.3/65535) * machine.ADC(4).read_u16()) - 0.706)/0.001721)
+    Amb_Temp_C = -99
+    Obj_Temp_C = -99
+    
+    try:
+        Amb_Temp_C = sensor.read_ambient_temp()
+        Obj_Temp_C = sensor.read_object_temp()
+        eprint('Ambient {:.1f} C     Object {:.1f} C'.format(Amb_Temp_C, Obj_Temp_C))
+    except:
+        # an error happened, so use the Pico temperature instead
+        eprint(' *** An error occured when reading the temperature sensor!')
+        Amb_Temp_C = Pico_Temp_C
+        Obj_Temp_C = Pico_Temp_C
+    
+    return Pico_Temp_C, Amb_Temp_C, Obj_Temp_C
+
 
 def GetVoltage():
     return machine.ADC(29).read_u16() * 3.0 * 3.3 / 65535
@@ -1471,11 +1611,19 @@ def DelayAfterTx():
 def TestForSi5351():
     PowerOsc.value(0) # ON
     time.sleep(0.2)
-    devlist = i2c.scan()
+    devlist = i2c0.scan()
     PowerOsc.value(1) # OFF
     #eprint(devlist)
     for item in devlist:
         if item == 0x60: return True
+    return False
+
+
+def TestForMLX90614(x_i2c):
+    addr = _I2C_Address
+    devlist = x_i2c.scan()
+    for item in devlist:
+        if item == addr: return True
     return False
 
 
@@ -1509,7 +1657,13 @@ def TxET(SlotNum):
     led.value(0) # LED OFF
     
     #ValueArr = [123456789]
-    ValueArr = [MY_BIGCOUNTER]
+    encodedTemps = encodeBigNumTemperatures()
+    
+    if MY_BIGCOUNTER > 255 or MY_BIGCOUNTER < 0: MY_BIGCOUNTER = 0
+    
+    final_value = encodedTemps * 256 + MY_BIGCOUNTER
+    
+    ValueArr = [final_value]
     MY_BIGCOUNTER += 1
     
     
@@ -1580,8 +1734,18 @@ VBATGPS = Pico5
 
 uart1 = UART(1, baudrate=9600, tx=Pin(8), rx=Pin(9))
 
-i2c = I2C(0, scl=Pin(5), sda=Pin(4), freq=100000)
+i2c0= I2C(0, scl=Pin(5), sda=Pin(4), freq=100000)
+i2c1 = I2C(_I2C_Channel, scl=Pin(_I2C_GPIO_SCL_Pin), sda=Pin(_I2C_GPIO_SDA_Pin), freq=100000)
+time.sleep_ms(200)
 
+if not TestForMLX90614(i2c1):
+    eprint('MLX90614 not found')
+    #blinkForeverLEDError(6)
+    sensor = None
+else:
+    sensor = MLX90614(i2c1)
+    time.sleep(0.2)
+    GetTemperature()
 
 
 # Set GPS to reset state
@@ -1621,7 +1785,11 @@ else:
         GetGPSUpdate()            # Get time, location, speed
         DelayAfterUpdate()        # wait until TX time
         if isGPSDataValid():
-            MY_TEMPERATURE = GetTemperature()  # get temperature during cold
+            
+            # Handle temperature
+            PicoTemp, AmbientTemp, ObjectTemp = GetTemperature()  # get temperature during cold
+            MY_TEMPERATURE = ObjectTemp   # choose the reported temperature source
+            
             disableGPS()          # GPS chip off
             enableOsc()           # TXCO and SI5351 on
             DelayMsDeadlineAndFeed(MY_TXTONE_DEADLINE)
